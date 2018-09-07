@@ -11,10 +11,12 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
-from nets import vgg
+import config as cfg
 import anchor_utils
 from First_Stage_Minibatch import FirstStageMinibatch
 from Second_Stage_Minibatch import SecondStageMinibatch
+from VGG16FeatureExtractor import VGG16FeatureExtractor
+from InceptionV2FeatureExtractor import InceptionV2FeatureExtractor
 
 
 slim = tf.contrib.slim
@@ -60,50 +62,54 @@ self.second_stage_losses()
 self.add_box_image_summaries
 
 '''
-import config as cfg
+
 
 class FasterRCNN(object):
     def __init__(self,
                  input_dict,
-                dropout_keep_prob=0.5,
                 is_training=True):
         self.input_dict = input_dict
         self.num_classes = cfg.num_classes
         self.anchor_scales = cfg.anchor_scales
         self.anchor_aspect = cfg.anchor_aspect
         self.num_anchors = len(cfg.anchor_scales)*len(cfg.anchor_aspect)
-        self.dropout_keep_prob = dropout_keep_prob
         self.is_training = is_training
+        if cfg.model == 'vgg16':
+            self.feature_extractor = VGG16FeatureExtractor(input_dict['image'], is_training)
+        if cfg.model == 'inception_v2':
+            self.feature_extractor = InceptionV2FeatureExtractor(input_dict['image'], is_training)
         self.pred_dict = {}
         self.loss_dict = {}
         self.build_model()
 
     def build_model(self):
-        self.FeatureExtractor()
+        self._extract()
+        self.assign_anchors()
         self.first_stage_pred()
         self.first_stage_proposals()
-        self.second_stage_pred()
-        self.second_stage_proposals()
+        if cfg.num_stages == 2:
+          self.second_stage_pred()
+          self.second_stage_proposals()
     
     def build_loss(self):
         self.first_stage_losses()
-        self.second_stage_losses()
-        total_loss = self.loss_dict['first_stage_box_loss']+ \
-                     self.loss_dict['first_stage_cls_loss']+ \
-                     self.loss_dict['second_stage_box_loss']+ \
-                     self.loss_dict['second_stage_cls_loss']
+        total_loss = self.loss_dict['first_stage_box_loss'] + self.loss_dict['first_stage_cls_loss']
+        
+        if cfg.num_stages == 2:
+          self.second_stage_losses()
+          total_loss += self.loss_dict['second_stage_box_loss']
+          total_loss += self.loss_dict['second_stage_cls_loss']
         tf.summary.scalar('total_loss', total_loss)
     
-    def FeatureExtractor(self):
-        net, endpoints = vgg.vgg_16(self.input_dict['image'], 
-                                    num_classes=None, 
-                                    is_training=self.is_training)
-        feature_map = endpoints['vgg_16/conv5/conv5_3']
+    def _extract(self):
+        feature_map = self.feature_extractor.get_feature_map()
         self.pred_dict['feature_map'] = feature_map
-        h, w = tf.shape(feature_map)[1], tf.shape(feature_map)[2]
+        return
+    def assign_anchors(self):
+        h, w = tf.shape(self.pred_dict['feature_map'])[1], tf.shape(self.pred_dict['feature_map'])[2]
         anchors = anchor_utils.make_anchors(h, w, 256, self.anchor_scales, self.anchor_aspect, stride=16)
         self.pred_dict['anchors'] = anchors
-        return feature_map
+        return
     
     def first_stage_pred(self):
         with tf.variable_scope('rpn_net'):
@@ -114,6 +120,13 @@ class FasterRCNN(object):
             first_stage_cls_score = tf.reshape(cls_score, [-1, 2])
             self.pred_dict['first_stage_box_pred'] = first_stage_box_pred
             self.pred_dict['first_stage_cls_score'] = first_stage_cls_score
+            if self.is_training:
+                ind = anchor_utils.pruning_boxes(self.pred_dict['anchors'])
+                self.pred_dict['anchors'] = tf.gather(self.pred_dict['anchors'], ind)
+                self.pred_dict['first_stage_box_pred'] = tf.gather(self.pred_dict['first_stage_box_pred'], ind)
+                self.pred_dict['first_stage_cls_score'] = tf.gather(self.pred_dict['first_stage_cls_score'], ind)
+            else:
+                self.pred_dict['anchors'] = anchor_utils.clipping_boxes(self.pred_dict['anchors'])
             return self.pred_dict
         
     def first_stage_proposals(self):
@@ -122,14 +135,16 @@ class FasterRCNN(object):
             obj_scores = slim.softmax(self.pred_dict['first_stage_cls_score'])[:, 1]            
             obj_scores, top_k_indices = tf.nn.top_k(obj_scores, k=cfg.first_stage_top_k_mns)
             bbox_pred = tf.gather(bbox_pred, top_k_indices)
-      
+            
+            num_proposals = cfg.first_stage_max_proposals
+            if self.is_training:
+                num_proposals = cfg.second_stage_minibatch_size
+                
             nms_index = tf.image.non_max_suppression(bbox_pred, 
                                                      obj_scores, 
-                                                     cfg.first_stage_max_proposals, 
+                                                     num_proposals, 
                                                      cfg.first_stage_nms_iou_threshold)
             valid_boxes = tf.gather(bbox_pred, nms_index)
-            if not self.is_training:
-                valid_boxes = tf.clip_by_value(valid_boxes, 0.0001, 0.9999)
             valid_scores = tf.gather(obj_scores, nms_index)
             def padd_boxes_with_zeros(boxes, scores, max_num_of_boxes):
                 pad_num = tf.cast(max_num_of_boxes, tf.int32) - tf.shape(boxes)[0]
@@ -138,12 +153,14 @@ class FasterRCNN(object):
                 final_boxes = tf.concat([boxes, zero_boxes], axis=0)
                 final_scores = tf.concat([scores, zero_scores], axis=0)
                 return final_boxes, final_scores
-          
-            rpn_proposals_boxes, rpn_proposals_scores = tf.cond(
-                tf.less(tf.shape(valid_boxes)[0], cfg.first_stage_max_proposals),
-                lambda: padd_boxes_with_zeros(valid_boxes, valid_scores, cfg.first_stage_max_proposals),
-                lambda: (valid_boxes, valid_scores))
             
+            rpn_proposals_boxes, rpn_proposals_scores = tf.cond(
+                tf.less(tf.shape(valid_boxes)[0], num_proposals),
+                lambda: padd_boxes_with_zeros(valid_boxes, valid_scores, num_proposals),
+                lambda: (valid_boxes, valid_scores))
+            rpn_proposals_boxes = anchor_utils.clipping_boxes(rpn_proposals_boxes)
+            if self.is_training:
+                rpn_proposals_boxes = tf.stop_gradient(rpn_proposals_boxes)
             self.pred_dict['first_stage_proposals_boxes']=rpn_proposals_boxes
             self.pred_dict['first_stage_proposals_scores']=rpn_proposals_scores
             return self.pred_dict
@@ -155,19 +172,13 @@ class FasterRCNN(object):
                                         bboxes, 
                                         tf.zeros(shape=[tf.shape(self.pred_dict['first_stage_proposals_boxes'])[0], ],dtype=tf.int32),
                                         [14, 14])
-          rois = slim.max_pool2d(rois, [2, 2], scope='pool5')
-          rois = slim.flatten(rois)
-          with slim.arg_scope([slim.fully_connected], weights_regularizer=slim.l2_regularizer(0.0001)):
-            net = slim.fully_connected(rois, 4096, scope='fc_1')
-            net = slim.dropout(net, keep_prob=self.dropout_keep_prob, is_training=self.is_training, scope='dropout_1')
-            net = slim.fully_connected(net, 4096, scope='fc_2')
-            net = slim.dropout(net, keep_prob=self.dropout_keep_prob, is_training=self.is_training, scope='dropout_2')
-        
-            cls_score = slim.fully_connected(net, self.num_classes+1, activation_fn=None, scope='classifier')
-            box_pred = slim.fully_connected(net, self.num_classes*4, activation_fn=None, scope='regressor')
-            self.pred_dict['second_stage_cls_score']=cls_score
-            self.pred_dict['second_stage_box_pred']=box_pred
-            return self.pred_dict
+
+          net = self.feature_extractor.get_second_stage_feature(rois)
+          cls_score = slim.fully_connected(net, self.num_classes+1, activation_fn=None, scope='classifier')
+          box_pred = slim.fully_connected(net, self.num_classes*4, activation_fn=None, scope='regressor')
+          self.pred_dict['second_stage_cls_score']=cls_score
+          self.pred_dict['second_stage_box_pred']=box_pred
+          return self.pred_dict
         
     def second_stage_proposals(self):
         with tf.variable_scope('second_stage_proposals'):
@@ -178,7 +189,7 @@ class FasterRCNN(object):
             anchor = tf.reshape(anchor, [-1, 4])
             
             decode_boxes = anchor_utils.decode_boxes(boxes, anchor)
-            decode_boxes = tf.clip_by_value(decode_boxes, 0.0001, 0.9999)
+            decode_boxes = tf.clip_by_value(decode_boxes, 0.0, 1.0)
             decode_boxes = tf.reshape(decode_boxes, [-1, self.num_classes*4])
             
             category = tf.argmax(scores, axis=1)
@@ -313,13 +324,14 @@ class FasterRCNN(object):
         image_1 = tf.image.draw_bounding_boxes(self.input_dict['image'], box_1, name='draw_first_stage_proposals_boxes')
         slim.summaries.add_image_summary(image_1, name='first_stage_proposals_boxes')
         
-        second_stage_proposals_boxes = self.pred_dict['second_stage_proposals_boxes']
-        second_stage_proposals_scores = self.pred_dict['second_stage_proposals_scores']
-        tf.summary.scalar('second_stage_proposals_scores', tf.reduce_max(second_stage_proposals_scores))
-        _, top_k_indices_2 = tf.nn.top_k(second_stage_proposals_scores, k=10)
-        box_2 = tf.expand_dims(tf.gather(second_stage_proposals_boxes, top_k_indices_2), axis=0)
-        image_2 = tf.image.draw_bounding_boxes(self.input_dict['image'], box_2, name='draw_second_stage_proposals_boxes')
-        slim.summaries.add_image_summary(image_2, name='second_stage_proposals_boxes')
+        if cfg.num_stages == 2:
+          second_stage_proposals_boxes = self.pred_dict['second_stage_proposals_boxes']
+          second_stage_proposals_scores = self.pred_dict['second_stage_proposals_scores']
+          tf.summary.scalar('second_stage_proposals_scores', tf.reduce_max(second_stage_proposals_scores))
+          _, top_k_indices_2 = tf.nn.top_k(second_stage_proposals_scores, k=10)
+          box_2 = tf.expand_dims(tf.gather(second_stage_proposals_boxes, top_k_indices_2), axis=0)
+          image_2 = tf.image.draw_bounding_boxes(self.input_dict['image'], box_2, name='draw_second_stage_proposals_boxes')
+          slim.summaries.add_image_summary(image_2, name='second_stage_proposals_boxes')
         
     
     

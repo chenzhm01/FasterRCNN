@@ -7,8 +7,28 @@ Created on Fri Aug 17 15:57:31 2018
 """
 
 import tensorflow as tf
+import config as cfg
 slim_example_decoder = tf.contrib.slim.tfexample_decoder
-tf.image.random_flip_left_right
+
+def resize_image(image):
+    shape = tf.shape(image)
+    if image.get_shape().ndims == 3:
+        height = tf.to_float(shape[0])
+        width = tf.to_float(shape[1])
+    if image.get_shape().ndims == 4:
+        height = tf.to_float(shape[1])
+        width = tf.to_float(shape[2])
+    scale0 = cfg.min_dimension/tf.cast(tf.minimum(height, width), tf.float32)
+    scale1 = cfg.max_dimension/tf.cast(tf.maximum(height, width), tf.float32)
+    new_height = tf.to_int32(height*scale0)
+    new_width = tf.to_int32(width*scale0)
+    new_height, new_width = tf.cond(tf.less(tf.maximum(new_height, new_width), 1024),
+                                    true_fn=lambda:(new_height, new_width),
+                                    false_fn=lambda:(tf.to_int32(height*scale1),
+                                                     tf.to_int32(width*scale1)))
+    image = tf.image.resize_images(image, (new_height, new_width))
+    return image
+
 class TfExampleDecoder(object):
   def __init__(self):
     self.keys_to_features = {
@@ -86,8 +106,8 @@ class TfExampleDecoder(object):
     return new_image, new_groundtruth_boxes
 
   def random_flip_left_right(self, tensor_dict):
-      #condition = tf.less(tf.random_uniform(shape=[], minval=0, maxval=1), 0.5)
-      condition = tf.less(0.1, 0.5)
+      condition = tf.less(tf.random_uniform(shape=[], minval=0, maxval=1), 0.5)
+      #condition = tf.less(0.1, 0.5)
       new_image, new_groundtruth_boxes = tf.cond(condition,
                                                  lambda: self.flip_left_right(tensor_dict),
                                                  lambda: (tensor_dict['image'], tensor_dict['groundtruth_boxes']))
@@ -96,35 +116,22 @@ class TfExampleDecoder(object):
       return tensor_dict
 
   def random_brightness(self, tensor_dict):
-      tensor_dict['image'] = tf.image.random_brightness(tensor_dict['image'], 0.3)
+      image = tf.image.random_brightness(tensor_dict['image'], 0.3)
+      image = tf.clip_by_value(image, 0, 255)
+      tensor_dict['image'] = image
       return tensor_dict
 
-  def resize_image(self, tensor_dict):
-    shape = tf.shape(tensor_dict['image'])
-    height = tf.to_float(shape[0])
-    width = tf.to_float(shape[1])
-    scale = 600.0/tf.cast(tf.minimum(height, width), tf.float32)
-    new_height = tf.to_int32(height*scale)
-    new_width = tf.to_int32(width*scale)
-    tensor_dict['image_height'] = tf.cast(new_height, dtype=tf.float32)
-    tensor_dict['image_width'] = tf.cast(new_width, dtype=tf.float32)
-    image = tf.image.resize_images(tensor_dict['image'], (new_height, new_width))
-    tensor_dict['image'] = image
-    return tensor_dict
-
   def processor(self, tensor_dict):
-    VGG_MEAN_rgb = [123.68, 116.779, 103.939]
-    tensor_dict = self.resize_image(tensor_dict)
+    tensor_dict['image'] = resize_image(tensor_dict['image'])
     tensor_dict = self.random_flip_left_right(tensor_dict)
-    tensor_dict = self.random_brightness(tensor_dict)
-    tensor_dict['image'] = tf.cast(tensor_dict['image'], dtype=tf.float32) - VGG_MEAN_rgb
+    #tensor_dict = self.random_brightness(tensor_dict)
     tensor_dict['image'] = tf.expand_dims(tensor_dict['image'], axis=0)
     return tensor_dict
 
   def get_batch(self, path_to_record):
     dataset = tf.data.TFRecordDataset(path_to_record)
     dataset = dataset.map(self.decode)
-    dataset = dataset.repeat(60).shuffle(256)
+    dataset = dataset.repeat(1000).shuffle(256)
     iterator = dataset.make_one_shot_iterator()
     tensor_dict = iterator.get_next()
     return tensor_dict

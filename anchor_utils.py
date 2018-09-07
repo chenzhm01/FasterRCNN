@@ -1,4 +1,5 @@
 import tensorflow as tf
+import config as cfg
 
 def make_anchors(h,w, base_anchor_size=256, anchor_scales=[0.5,1,2], anchor_ratios=[0.5,1,2], stride=16, name='make_anchors'):
     with tf.variable_scope(name):
@@ -38,7 +39,7 @@ def enum_ratios(anchors, anchor_ratios):
                                       tf.zeros([num_anchors_per_location,]),
                                       ws, hs]))
 
-def encode_boxes(unencode_boxes, reference_anchors, scale_factors=[10.0, 10.0, 5.0, 5.0]):
+def encode_boxes(unencode_boxes, reference_anchors):
     with tf.variable_scope('encode'):
         ymin, xmin, ymax, xmax = tf.unstack(unencode_boxes, axis=1)
         reference_ymin, reference_xmin, reference_ymax, reference_xmax = tf.unstack(reference_anchors, axis=1)
@@ -60,21 +61,21 @@ def encode_boxes(unencode_boxes, reference_anchors, scale_factors=[10.0, 10.0, 5
         t_ycenter = (y_center - reference_ycenter) / reference_h
         t_w = tf.log(w / reference_w)
         t_h = tf.log(h / reference_h)
-        if scale_factors:
-            t_xcenter *= scale_factors[0]
-            t_ycenter *= scale_factors[1]
-            t_w *= scale_factors[2]
-            t_h *= scale_factors[3]
+        if cfg.anchor_scale_factors:
+            t_xcenter *= cfg.anchor_scale_factors[0]
+            t_ycenter *= cfg.anchor_scale_factors[1]
+            t_w *= cfg.anchor_scale_factors[2]
+            t_h *= cfg.anchor_scale_factors[3]
         return tf.transpose(tf.stack([t_ycenter, t_xcenter, t_h, t_w]))
 
-def decode_boxes(encode_boxes, reference_anchors, scale_factors=[10.0, 10.0, 5.0, 5.0]):
+def decode_boxes(encode_boxes, reference_anchors):
     with tf.variable_scope('decode'):
         t_ycenter, t_xcenter, t_h, t_w = tf.unstack(encode_boxes, axis=1)
-        if scale_factors:
-            t_xcenter /= scale_factors[0]
-            t_ycenter /= scale_factors[1]
-            t_w /= scale_factors[2]
-            t_h /= scale_factors[3]
+        if cfg.anchor_scale_factors:
+            t_xcenter /= cfg.anchor_scale_factors[0]
+            t_ycenter /= cfg.anchor_scale_factors[1]
+            t_w /= cfg.anchor_scale_factors[2]
+            t_h /= cfg.anchor_scale_factors[3]
         reference_ymin, reference_xmin, reference_ymax, reference_xmax = tf.unstack(reference_anchors, axis=1)
 
         reference_xcenter = (reference_xmin + reference_xmax) / 2.
@@ -92,3 +93,22 @@ def decode_boxes(encode_boxes, reference_anchors, scale_factors=[10.0, 10.0, 5.0
         predict_ymin = predict_ycenter - predict_h / 2.
         predict_ymax = predict_ycenter + predict_h / 2.
         return tf.transpose(tf.stack([predict_ymin, predict_xmin, predict_ymax, predict_xmax]))
+    
+def clipping_boxes(boxes):
+    with tf.name_scope('clipping_boxes'):
+      boxes = tf.clip_by_value(boxes, 0.0, 1.0)
+      return boxes
+
+def pruning_boxes(boxes):
+    with tf.name_scope('pruning_boxes'):
+      ymin, xmin, ymax, xmax = tf.unstack(boxes, axis=1)
+      ymin_ind = tf.greater_equal(ymin, 0)
+      xmin_ind = tf.greater_equal(ymin, 0)
+      ymax_ind = tf.less_equal(ymax, 1)
+      xmax_ind = tf.less_equal(ymax, 1)
+      
+      ind = tf.transpose(tf.stack([ymin_ind, xmin_ind, ymax_ind, xmax_ind]))
+      ind = tf.cast(ind, dtype=tf.int32)
+      ind = tf.reduce_sum(ind, axis=1)
+      ind = tf.where(tf.equal(ind, 4))
+      return tf.reshape(ind, [-1, ])
